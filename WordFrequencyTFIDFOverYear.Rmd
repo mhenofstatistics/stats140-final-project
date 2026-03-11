@@ -1,0 +1,255 @@
+---
+title: "Topic Analysis"
+author: "John Orroth"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# install.packages(c("tidyverse", "tidytext", "lubridate", "scales",
+#                    "topicmodels", "tm", "stringr", "forcats", "ggridges"))
+
+#install.packages("ggridges")
+library(tidyverse)
+library(tidytext)
+library(lubridate)
+library(scales)
+library(topicmodels)
+library(tm)
+library(stringr)
+library(forcats)
+library(ggridges)
+
+trump_posts <- read.csv("filtered_trump_dat.csv")
+```
+
+```{r}
+# Replace this with your actual file read if needed
+# trump_posts <- read_csv("trump_posts.csv")
+
+trump_posts <- trump_posts %>%
+  mutate(
+    date = ymd_hms(date),
+    year = year(date),
+    month = floor_date(date, unit = "month"),
+    platform = as.factor(platform),
+    deleted_flag = as.logical(deleted_flag)
+  ) %>%
+  filter(!is.na(text), text != "")
+
+# Basic text cleaning before tokenization
+trump_clean <- trump_posts %>%
+  mutate(
+    text_clean = text %>%
+      str_to_lower() %>%
+      str_replace_all("http[s]?://\\S+", " ") %>%     # remove urls
+      str_replace_all("www\\.\\S+", " ") %>%
+      str_replace_all("&amp;", " ") %>%
+      str_replace_all("[^a-z\\s']", " ") %>%          # keep letters/apostrophes
+      str_replace_all("\\s+", " ") %>%
+      str_trim()
+  )
+
+# Custom words you may want to remove because they dominate but add little meaning
+custom_stop <- tibble(
+  word = c("trump", "donald", "realdonaldtrump", "amp", "rt", "will", "just",
+           "today", "tonight", "tomorrow", "one", "two", "new", "great")
+)
+
+tokens <- trump_clean %>%
+  select(X, date, year, month, platform, text_clean) %>%
+  unnest_tokens(word, text_clean) %>%
+  filter(str_detect(word, "[a-z]")) %>%
+  anti_join(stop_words, by = "word") %>%
+  anti_join(custom_stop, by = "word") %>%
+  filter(nchar(word) >= 3)
+
+head(tokens)
+```
+
+```{r}
+yearly_word_counts <- tokens %>%
+  count(year, word, sort = TRUE)
+
+head(yearly_word_counts)
+
+yearly_word_props <- yearly_word_counts %>%
+  group_by(year) %>%
+  mutate(
+    total_words_year = sum(n),
+    prop = n / total_words_year,
+    per_10k = prop * 10000
+  ) %>%
+  ungroup()
+
+head(yearly_word_props)
+
+top_words_overall <- tokens %>%
+  count(word, sort = TRUE) %>%
+  slice_max(n, n = 20)
+
+ggplot(top_words_overall, aes(x = reorder(word, n), y = n)) +
+  geom_col(fill = "steelblue", width = 0.8) +
+  coord_flip() +
+  labs(
+    title = "Most Frequent Words Across All Trump Posts",
+    x = NULL,
+    y = "Word Count"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+
+```{r}
+top_20_words <- tokens %>%
+  count(word, sort = TRUE) %>%
+  slice_max(n, n = 20) %>%
+  pull(word)
+
+heatmap_data <- yearly_word_props %>%
+  filter(word %in% top_20_words)
+
+ggplot(heatmap_data, aes(x = year, y = fct_reorder(word, per_10k), fill = per_10k)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "#dbe9f6", high = "#08306b", labels = comma) +
+  labs(
+    title = "Top Word Frequency Over Time",
+    subtitle = "Frequency shown as occurrences per 10,000 words each year",
+    x = "Year",
+    y = NULL,
+    fill = "Per 10k words"
+  ) +
+  theme_minimal(base_size = 13)
+```
+```{r}
+selected_words <- c("america", "country", "people", "democrats", "republicans",
+                    "border", "china", "jobs", "fake", "election")
+
+trend_data <- yearly_word_props %>%
+  filter(word %in% selected_words)
+
+ggplot(trend_data, aes(x = year, y = per_10k, color = word)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = seq(min(trend_data$year), max(trend_data$year), by = 1)) +
+  labs(
+    title = "Selected Word Trends Over Time",
+    subtitle = "Occurrences per 10,000 words",
+    x = "Year",
+    y = "Per 10k words",
+    color = "Word"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r}
+platform_word_props <- tokens %>%
+  count(year, platform, word) %>%
+  group_by(year, platform) %>%
+  mutate(
+    total_words = sum(n),
+    prop = n / total_words,
+    per_10k = prop * 10000
+  ) %>%
+  ungroup()
+
+platform_trend <- platform_word_props %>%
+  filter(word %in% c("america", "china", "border", "election", "media"))
+
+ggplot(platform_trend, aes(x = year, y = per_10k, color = platform)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~word, scales = "free_y") +
+  labs(
+    title = "Word Usage Over Time by Platform",
+    subtitle = "Comparing Twitter and Truth Social",
+    x = "Year",
+    y = "Per 10k words",
+    color = "Platform"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+
+```{r}
+monthly_word_props <- tokens %>%
+  count(month, word) %>%
+  group_by(month) %>%
+  mutate(
+    total_words = sum(n),
+    prop = n / total_words,
+    per_10k = prop * 10000
+  ) %>%
+  ungroup()
+
+monthly_election <- monthly_word_props %>%
+  filter(word %in% c("election", "china", "border", "media"))
+
+ggplot(monthly_election, aes(x = month, y = per_10k, color = word)) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Monthly Word Frequency Over Time",
+    subtitle = "Occurrences per 10,000 words",
+    x = "Month",
+    y = "Per 10k words",
+    color = "Word"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+tfidf
+
+```{r}
+library(tidyverse)
+library(tidytext)
+
+year_word_tfidf <- tokens %>%
+  count(year, word, sort = TRUE) %>%
+  bind_tf_idf(word, year, n) %>%
+  arrange(desc(tf_idf))
+
+top_tfidf_by_year <- year_word_tfidf %>%
+  group_by(year) %>%
+  slice_max(tf_idf, n = 8, with_ties = FALSE) %>%
+  ungroup()
+
+# Create 4-year groups
+year_groups <- tibble(
+  year = sort(unique(top_tfidf_by_year$year))
+) %>%
+  mutate(group = ceiling(row_number() / 4))
+
+# Join groups back to the tf-idf data
+top_tfidf_by_year_grouped <- top_tfidf_by_year %>%
+  left_join(year_groups, by = "year")
+
+# Split into a list of data frames, one per 4-year chunk
+plot_list <- top_tfidf_by_year_grouped %>%
+  group_split(group)
+
+# Make one plot for each chunk
+for (i in seq_along(plot_list)) {
+  
+  plot_data <- plot_list[[i]] %>%
+    mutate(word = reorder_within(word, tf_idf, year))
+  
+  p <- ggplot(plot_data, aes(x = tf_idf, y = word)) +
+    geom_col(fill = "steelblue") +
+    facet_wrap(~year, scales = "free_y", ncol = 2) +
+    scale_y_reordered() +
+    labs(
+      title = paste("Top TF-IDF Words by Year: Group", i),
+      x = "TF-IDF",
+      y = NULL
+    ) +
+    theme_minimal(base_size = 13)
+  
+  print(p)
+}
+```

@@ -1,0 +1,84 @@
+---
+title: "Trump Tweets Sentiment Analysis"
+author: "Daniel Wang"
+date: "2026-02-28"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(vader)
+
+# Load data
+df <- read.csv("filtered_trump_dat.csv")
+
+# ── Run VADER on every tweet ──────────────────────────────────────────────────
+# vader_df() accepts a character vector and returns a dataframe with scores
+vader_results <- vader_df(df$text)
+
+# ── Combine with original data ────────────────────────────────────────────────
+df_sentiment <- bind_cols(df, vader_results) %>%
+  rename(
+    vader_positive  = pos,
+    vader_negative  = neg,
+    vader_neutral   = neu,
+    vader_compound  = compound   # main score: -1 (most negative) to +1 (most positive)
+  ) %>%
+  mutate(
+    sentiment_label = case_when(
+      vader_compound >= 0.05  ~ "positive",
+      vader_compound <= -0.05 ~ "negative",
+      TRUE                    ~ "neutral"
+    )
+  )
+
+# ── Quick summary ─────────────────────────────────────────────────────────────
+cat("Sentiment label distribution:\n")
+print(table(df_sentiment$sentiment_label))
+
+cat("\nAverage compound score:", round(mean(df_sentiment$vader_compound, na.rm = TRUE), 3), "\n")
+
+# ── Plot sentiment over time ──────────────────────────────────────────────────
+df_sentiment %>%
+  mutate(date = as.Date(date)) %>%
+  ggplot(aes(x = date, y = vader_compound)) +
+  geom_point(aes(color = sentiment_label), alpha = 0.2, size = 0.8) +
+  geom_smooth(method = "loess", se = TRUE, color = "black", linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  scale_color_manual(values = c("positive" = "steelblue",
+                                "negative" = "tomato",
+                                "neutral"  = "gray60")) +
+  labs(title    = "Tweet Sentiment Over Time (VADER)",
+       subtitle = "Compound score: -1 (most negative) to +1 (most positive)",
+       x        = "Date",
+       y        = "VADER Compound Score",
+       color    = "Sentiment") +
+  theme_minimal()
+
+head(df_sentiment)
+# ── Save results ──────────────────────────────────────────────────────────────
+# write.csv(df_sentiment, "tweet_sentiment_vader.csv", row.names = FALSE)
+```
+
+```{r}
+df_sentiment <- df_sentiment %>%
+  select(-text...16) %>%
+  rename(text = text...5)
+```
+
+
+```{r}
+head(df_sentiment)
+head(df)
+```
+
+```{r}
+write.csv(df_sentiment, "trump_tweets_with_sentiment.csv", row.names = FALSE)
+```
+
+
+
