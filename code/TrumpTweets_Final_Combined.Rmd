@@ -1,0 +1,1820 @@
+---
+title: "Trump Tweets: Comprehensive Analysis (2009–2026)"
+author: "Isaiah C. Mireles, Evan Garcia, Kyle He, John Orroth, Prem Kollu, Monty Soladay, Daniel Wang"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+    code_folding: hide
+    df_print: paged
+    self_contained: true
+---
+
+```{r global-setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+---
+
+Generative AI tools were used to assist with drafting and organizational structuring. All analyses, interpretations, and final editorial decisions were conducted and reviewed by the team.
+
+
+# Project Description
+
+This project analyzes a complete archive of 90,000+ posts made by Donald Trump on X (Twitter) and Truth Social from 2009–2026. Using R and Python, we clean, filter, and structure the data to focus exclusively on original, text-based posts—excluding reposts, quotes, and media-only content—to isolate Trump's direct public communication.
+
+Our analysis covers:
+
+1. **Data loading & pre-processing** — cleaning raw tweet text for downstream analysis
+2. **Exploratory Data Analysis (EDA)** — post counts, character-level features, word clouds
+3. **Word Frequency & TF-IDF** — top words, temporal trends, platform comparison
+4. **Sentiment Analysis (VADER)** — compound scores over time and by political era
+5. **Engagement Over Time** — impact of candidacy announcement, 2020 election loss, January 6th, and presidency era
+6. **Text Classification** — zero-shot theme labeling via OpenAI embeddings
+7. **Virality Modeling** — logistic regression and random forest predicting top-5% engagement
+8. **Clustering** — HDBSCAN on character n-gram TF-IDF + UMAP embeddings
+
+---
+
+# 1. Setup: Libraries & Data Loading
+
+All data files must be placed in the **same directory** as this `.Rmd` file before knitting.
+
+Required data files:
+
+- `trump_raw.csv` — full unfiltered archive (~90k posts, starting point for all analysis)
+- `tweet_themes_with_sentiment.csv` — 5k-sample with theme labels and sentiment scores
+- `20k_tweet_themes_with_sentiment.csv` — 20k-sample with theme labels and sentiment scores
+
+```{r load-libraries}
+# ── Core ──────────────────────────────────────────────────────────────────────
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(stringr)
+library(forcats)
+
+# ── Text analysis ─────────────────────────────────────────────────────────────
+library(tidytext)
+library(topicmodels)
+library(tm)
+library(ggridges)
+library(wordcloud2)
+library(vader)
+
+# ── Modeling ──────────────────────────────────────────────────────────────────
+library(caret)
+library(randomForest)
+library(pROC)
+library(broom)
+
+# ── Clustering ────────────────────────────────────────────────────────────────
+library(text2vec)
+library(irlba)
+library(Matrix)
+library(uwot)
+library(dbscan)
+library(purrr)
+
+# ── Layout helpers ────────────────────────────────────────────────────────────
+library(gridExtra)
+library(RColorBrewer)
+
+set.seed(42)
+```
+
+```{r load-data}
+# ── Raw dataset (~90k posts, all platforms, all post types) ───────────────────
+trump_raw <- read.csv("trump_raw.csv", stringsAsFactors = FALSE)
+
+# ── Theme-labeled samples (produced by Section 7 classification pipeline) ─────
+df_20k <- read.csv("20k_tweet_themes_with_sentiment.csv", stringsAsFactors = FALSE)
+
+cat("Raw dataset rows:  ", nrow(trump_raw), "\n")
+cat("Date range (raw):  ", range(trump_raw$date), "\n")
+cat("20k sample rows:   ", nrow(df_20k), "\n")
+```
+
+---
+
+# 2. Data Filtering & Pre-Processing
+
+```{r}
+df <- 
+  read.csv("trump_raw.csv")
+```
+
+## colnames :
+
+```{r}
+colnames(df)
+```
+
+## Change Date format
+
+```{r data, message = FALSE, error = FALSE}
+library(tidyverse)
+library(lubridate)
+
+df <- df %>%
+  mutate(date = ymd_hms(date))
+```
+
+```{r}
+lst <- as.list(df)
+
+# Number of unique values : 
+cardinality <- lapply(lst, function(x){length(unique(x))})
+```
+
+```{r}
+cardinality$platform
+unique(df$platform)
+```
+
+```{r}
+before <- nrow(df)
+
+library(stringr)
+df <- 
+  df |>
+  filter(
+    quote_flag == "False",
+    !str_detect(text, "^\\[Video\\]|^\\[Image\\]")
+  ) |>
+  filter(!str_detect(text, "^RT")) |>
+  filter(!str_detect(text, "^https:// truthsocial.com")) |>
+  filter(!str_detect(text, "^https:// justthenews.com")) |>
+  filter(!str_detect(text, "^https:// x.com")) |>
+  filter(!str_detect(text, "^https")) 
+
+after <- nrow(df)
+paste0("We reduced the data by ", after-before, " observations -- 30k obs.")
+```
+
+
+### KEEP : Replies
+
+```{r}
+replies <- unique(df$in_reply_to) |> as.data.frame()
+replies
+before <- nrow(df)
+
+df <- df[df$in_reply_to %in% c("", "nan"), ] 
+
+df <- df |> filter(repost_flag != "True") 
+after <- nrow(df)
+paste0("We reduced the data by ", after-before, " observations -- 4k")
+```
+
+## Relevant Col
+
+```{r}
+cardinality_func <- function(x){length(unique(x))}
+df_filtered <-
+  df |> 
+  select(-c(in_reply_to, id, quote_flag, repost_flag)) |> 
+  arrange(date) 
+```
+
+```{r set-analysis-df}
+# Alias used throughout the rest of the document
+df     <- df_filtered
+df_raw <- df_filtered  # keeps downstream code that references df_raw working
+data   <- df_filtered  # alias used in engagement sections
+```
+
+
+# 3. Exploratory Data Analysis
+
+## 3.1 Tweet-Level Features
+
+Feature columns (`exclamation_count`, `capital_count`, `hashtag_count_raw`, `total_letters`) were computed on the **original** text during the filtering step in Section 2, before URL/hashtag removal, so the counts accurately reflect Trump's raw posting style.
+
+```{r}
+# ============================================================
+# Feature Engineering: Exclamation Points, Capital Letters,
+# Hashtags, Total Letters
+# ============================================================
+
+trump_features <- data %>%
+  mutate(
+    exclamation_count = str_count(text, fixed("!")),
+    capital_count     = str_count(text, "[A-Z]"),
+    hashtag_count     = str_count(text, "#\\S+"),
+    total_letters     = str_count(text, "[A-Za-z]")
+  )
+
+# Quick check
+trump_features %>%
+  select(text, exclamation_count, capital_count, hashtag_count, total_letters) %>%
+  head(10)
+```
+
+```{r}
+# Summary stats across all 58,020 tweets
+trump_features %>%
+  select(exclamation_count, capital_count, hashtag_count, total_letters) %>%
+  summary()
+```
+
+```{r eda-feature-plots, fig.width=10, fig.height=8}
+p1 <- ggplot(trump_features, aes(x = exclamation_count)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+  coord_cartesian(xlim = c(0, 10)) +
+  labs(title = "Exclamation Points per Tweet", x = "Count", y = "# of Tweets") +
+  theme_minimal()
+
+p2 <- ggplot(trump_features, aes(x = capital_count)) +
+  geom_histogram(binwidth = 2, fill = "tomato", color = "white") +
+  coord_cartesian(xlim = c(0, 100)) +
+  labs(title = "Capital Letters per Tweet", x = "Count", y = "# of Tweets") +
+  theme_minimal()
+
+p3 <- ggplot(trump_features, aes(x = hashtag_count)) +
+  geom_histogram(binwidth = 1, fill = "seagreen", color = "white") +
+  coord_cartesian(xlim = c(0, 8)) +
+  labs(title = "Hashtags per Tweet", x = "Count", y = "# of Tweets") +
+  theme_minimal()
+
+p4 <- ggplot(trump_features, aes(x = total_letters)) +
+  geom_histogram(binwidth = 10, fill = "purple", color = "white") +
+  coord_cartesian(xlim = c(0, 500)) +
+  labs(title = "Total Letters per Tweet", x = "Count", y = "# of Tweets") +
+  theme_minimal()
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+```
+
+**Key observations:**
+
+- Most tweets have 0–1 exclamation points; usage is present but restrained.
+- Capital letter count follows a bell shape peaking around 10–15, normal for English text.
+- The vast majority of tweets have **zero hashtags** — unusually low for political Twitter.
+- Tweet length shows a **bimodal distribution**: peaks around 100 and 280 characters, reflecting Twitter's 2017 character-limit expansion from 140 to 280.
+
+## 3.2 Word Cloud
+
+```{r wordcloud, fig.width=8, fig.height=6}
+set.seed(111)
+
+custom_stop_wc <- tibble(
+  word = c("https", "http", "x", "x.com", "t.co", "trump", "truthsocial",
+           "truthsocial.com", "twitter", "twitter.com", "www",
+           "pic.twitter.com", "nan", "realdonaldtrump",
+           "00", "12", "1", "u.s", "0", "10", "04", "rt", "05", "bit.ly"),
+  lexicon = "custom"
+)
+
+all_stop_wc <- bind_rows(stop_words, custom_stop_wc)
+
+wc_tokens   <- df %>% unnest_tokens(word, text) %>% anti_join(all_stop_wc, by = "word")
+word_freq   <- wc_tokens %>% count(word, sort = TRUE)
+top_60_words <- word_freq %>% slice_max(n, n = 60, with_ties = FALSE)
+
+wordcloud2(top_60_words, size = 0.7)
+```
+
+---
+
+# 4. Word Frequency & TF-IDF Over Time
+
+
+```{r tfidf-setup}
+trump_clean <- df %>%
+  mutate(
+    date = as.Date(date),
+    year = year(date),
+    month = month(date),
+    text_clean_tfidf = text %>%
+      str_to_lower() %>%
+      str_replace_all("http[s]?://\\S+", " ") %>%
+      str_replace_all("www\\.\\S+", " ") %>%
+      str_replace_all("&amp;", " ") %>%
+      str_replace_all("[^a-z\\s']", " ") %>%
+      str_replace_all("\\s+", " ") %>%
+      str_trim()
+  )
+
+custom_stop_tfidf <- tibble(
+  word = c("trump", "donald", "realdonaldtrump", "amp", "rt", "will", "just",
+           "today", "tonight", "tomorrow", "one", "two", "new", "great")
+)
+
+tokens <- trump_clean %>%
+  select(date, year, month, platform, text_clean_tfidf) %>%
+  unnest_tokens(word, text_clean_tfidf) %>%
+  filter(str_detect(word, "[a-z]")) %>%
+  anti_join(stop_words, by = "word") %>%
+  anti_join(custom_stop_tfidf, by = "word") %>%
+  filter(nchar(word) >= 3)
+```
+
+## 4.1 Most Frequent Words Overall
+
+```{r top-words-overall, fig.width=9, fig.height=6}
+top_words_overall <- tokens %>%
+  count(word, sort = TRUE) %>%
+  slice_max(n, n = 20)
+
+ggplot(top_words_overall, aes(x = reorder(word, n), y = n)) +
+  geom_col(fill = "steelblue", width = 0.8) +
+  coord_flip() +
+  labs(title = "Most Frequent Words Across All Trump Posts", x = NULL, y = "Word Count") +
+  theme_minimal(base_size = 14)
+```
+
+## 4.2 Frequency Heatmap Over Time
+
+```{r freq-heatmap, fig.width=11, fig.height=7}
+yearly_word_props <- tokens %>%
+  count(year, word, sort = TRUE) %>%
+  group_by(year) %>%
+  mutate(total_words_year = sum(n), prop = n / total_words_year, per_10k = prop * 10000) %>%
+  ungroup()
+
+top_20_words <- tokens %>% count(word, sort = TRUE) %>% slice_max(n, n = 20) %>% pull(word)
+heatmap_data <- yearly_word_props %>% filter(word %in% top_20_words)
+
+ggplot(heatmap_data, aes(x = year, y = fct_reorder(word, per_10k), fill = per_10k)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "#dbe9f6", high = "#08306b", labels = comma) +
+  labs(title = "Top Word Frequency Over Time",
+       subtitle = "Occurrences per 10,000 words each year",
+       x = "Year", y = NULL, fill = "Per 10k words") +
+  theme_minimal(base_size = 13)
+```
+
+## 4.3 Selected Word Trends
+
+```{r word-trends, fig.width=11, fig.height=6}
+selected_words <- c("america", "country", "people", "democrats", "republicans",
+                    "border", "china", "jobs", "fake", "election")
+
+trend_data <- yearly_word_props %>% filter(word %in% selected_words)
+
+ggplot(trend_data, aes(x = year, y = per_10k, color = word)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = seq(min(trend_data$year), max(trend_data$year), by = 1)) +
+  labs(title = "Selected Word Trends Over Time",
+       subtitle = "Occurrences per 10,000 words",
+       x = "Year", y = "Per 10k words", color = "Word") +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## 4.4 Word Usage by Platform
+
+```{r platform-words, fig.width=11, fig.height=7}
+platform_word_props <- tokens %>%
+  count(year, platform, word) %>%
+  group_by(year, platform) %>%
+  mutate(total_words = sum(n), prop = n / total_words, per_10k = prop * 10000) %>%
+  ungroup()
+
+platform_trend <- platform_word_props %>%
+  filter(word %in% c("america", "china", "border", "election", "media"))
+
+ggplot(platform_trend, aes(x = year, y = per_10k, color = platform)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~word, scales = "free_y") +
+  labs(title = "Word Usage Over Time by Platform",
+       subtitle = "Comparing Twitter and Truth Social",
+       x = "Year", y = "Per 10k words", color = "Platform") +
+  theme_minimal(base_size = 13)
+```
+
+## 4.5 TF-IDF: Distinctive Words by Year
+
+```{r tfidf-by-year, fig.width=10, fig.height=7}
+year_word_tfidf <- tokens %>%
+  count(year, word, sort = TRUE) %>%
+  bind_tf_idf(word, year, n) %>%
+  arrange(desc(tf_idf))
+
+top_tfidf_by_year <- year_word_tfidf %>%
+  group_by(year) %>%
+  slice_max(tf_idf, n = 8, with_ties = FALSE) %>%
+  ungroup()
+
+year_groups <- tibble(year = sort(unique(top_tfidf_by_year$year))) %>%
+  mutate(group = ceiling(row_number() / 4))
+
+top_tfidf_grouped <- top_tfidf_by_year %>% left_join(year_groups, by = "year")
+plot_list <- top_tfidf_grouped %>% group_split(group)
+
+for (i in seq_along(plot_list)) {
+  plot_data <- plot_list[[i]] %>% mutate(word = reorder_within(word, tf_idf, year))
+  p <- ggplot(plot_data, aes(x = tf_idf, y = word)) +
+    geom_col(fill = "steelblue") +
+    facet_wrap(~year, scales = "free_y", ncol = 2) +
+    scale_y_reordered() +
+    labs(title = paste("Top TF-IDF Words by Year: Group", i), x = "TF-IDF", y = NULL) +
+    theme_minimal(base_size = 13)
+  print(p)
+}
+```
+
+---
+
+# 5. Sentiment Analysis (VADER)
+
+```{r vader-run}
+vader_results <- vader_df(df$text)
+
+df_sentiment <- bind_cols(df, vader_results) %>%
+  rename(
+    vader_positive = pos,
+    vader_negative = neg,
+    vader_neutral  = neu,
+    vader_compound = compound
+  ) %>%
+  mutate(
+    sentiment_label = case_when(
+      vader_compound >= 0.05  ~ "positive",
+      vader_compound <= -0.05 ~ "negative",
+      TRUE                    ~ "neutral"
+    )
+  )
+
+cat("Sentiment label distribution:\n")
+print(table(df_sentiment$sentiment_label))
+cat("\nAverage compound score:", round(mean(df_sentiment$vader_compound, na.rm = TRUE), 3), "\n")
+```
+
+## 5.1 Sentiment Score Distribution
+
+```{r sentiment-dist, fig.width=9, fig.height=5}
+ggplot(df_sentiment, aes(x = vader_compound)) +
+  geom_histogram(bins = 60, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", linewidth = 1) +
+  labs(title = "Distribution of Tweet Sentiment (VADER)",
+       x = "Compound Sentiment Score (−1 to +1)", y = "Number of Tweets") +
+  theme_minimal(base_size = 14)
+```
+
+## 5.2 Proportion by Sentiment Category
+
+```{r sentiment-prop, fig.width=7, fig.height=5}
+df_sentiment %>%
+  count(sentiment_label) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = sentiment_label, y = prop, fill = sentiment_label)) +
+  geom_col(width = 0.6) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Proportion of Positive, Neutral, and Negative Tweets",
+       x = NULL, y = "Percentage of Tweets") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+```
+
+
+## 5.3 Positive vs. Negative Share by Month
+
+```{r sentiment-monthly, fig.width=11, fig.height=5}
+df_time_sent <- df_sentiment %>%
+  mutate(date = as.Date(date), year_month = floor_date(date, "month")) %>%
+  group_by(year_month) %>%
+  summarise(
+    positive_prop = mean(sentiment_label == "positive"),
+    negative_prop = mean(sentiment_label == "negative"),
+    neutral_prop  = mean(sentiment_label == "neutral"),
+    .groups = "drop"
+  )
+
+df_long_filtered <- df_time_sent %>%
+  select(year_month, positive_prop, negative_prop) %>%
+  pivot_longer(-year_month, names_to = "sentiment", values_to = "proportion") %>%
+  mutate(
+    year_month = as.Date(year_month),
+    sentiment  = factor(sentiment, levels = c("positive_prop", "negative_prop"))
+  )
+
+start_pres <- as.Date("2017-01-20")
+end_pres   <- as.Date("2021-01-20")
+xmin_all   <- min(df_long_filtered$year_month, na.rm = TRUE)
+xmax_all   <- max(df_long_filtered$year_month, na.rm = TRUE)
+
+shade_df <- tibble(
+  period = c("Pre-Presidency", "Presidency", "Post-Presidency"),
+  xmin   = c(xmin_all, start_pres, end_pres),
+  xmax   = c(start_pres, end_pres, xmax_all)
+)
+
+ggplot() +
+  geom_rect(data = shade_df,
+            aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = period),
+            alpha = 0.15, inherit.aes = FALSE) +
+  geom_line(data = df_long_filtered,
+            aes(x = year_month, y = proportion, color = sentiment), linewidth = 1) +
+  scale_color_manual(values = c("positive_prop" = "steelblue", "negative_prop" = "tomato"),
+                     labels = c("Positive", "Negative")) +
+  scale_fill_manual(breaks = c("Pre-Presidency", "Presidency", "Post-Presidency"),
+                    values = c("Pre-Presidency"  = "#F3D35B",
+                               "Presidency"      = "#F06A6A",
+                               "Post-Presidency" = "#74A9FF")) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title    = "Positive vs. Negative Tweet Sentiment Over Time",
+       subtitle = "Shading: Pre-Presidency | Presidency | Post-Presidency",
+       x = "Year", y = "Percentage of Tweets", color = "Sentiment", fill = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank())
+```
+
+---
+
+# 6. Engagement Over Time
+
+This section tests whether key political events — Trump's candidacy announcement, the 2020 election loss, the January 6th Capitol riot, and his presidency overall — are associated with measurable shifts in post engagement and frequency.
+
+```{r engagement-setup}
+data <- df %>%
+  mutate(
+    day = as.Date(date)
+  )
+
+df <- data
+
+monthly_counts <- data %>%
+  mutate(month_yr = lubridate::floor_date(.data$day, unit = "month")) %>%
+  group_by(month_yr) %>%
+  summarise(
+    n_posts = n(),
+    .groups = "drop"
+  )
+
+engagement_trends <- data %>%
+  mutate(month_yr = lubridate::floor_date(.data$day, unit = "month")) %>%
+  group_by(month_yr) %>%
+  summarise(
+    Likes = mean(favorite_count, na.rm = TRUE),
+    Retweets = mean(repost_count, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(Likes, Retweets),
+    names_to = "Metric",
+    values_to = "Count"
+  )
+
+inauguration_date <- as.Date("2017-01-20")
+term_end_date     <- as.Date("2021-01-20")
+```
+
+
+
+```{r overall-trends, fig.width=11, fig.height=8}
+start_date <- min(monthly_counts$month_yr)
+end_date   <- max(monthly_counts$month_yr)
+
+p_monthly <- ggplot(monthly_counts, aes(x = month_yr, y = n_posts)) +
+  ggplot2::annotate("rect", xmin = start_date,        xmax = inauguration_date,
+                    ymin = -Inf, ymax = Inf, alpha = 0.1, fill = "#FFB347") +
+  ggplot2::annotate("rect", xmin = inauguration_date, xmax = term_end_date,
+                    ymin = -Inf, ymax = Inf, alpha = 0.1, fill = "#FF6961") +
+  ggplot2::annotate("rect", xmin = term_end_date,     xmax = end_date,
+                    ymin = -Inf, ymax = Inf, alpha = 0.1, fill = "#AEC6CF") +
+  geom_line(color = "#4E79A7", linewidth = 0.7) +
+  geom_vline(xintercept = c(inauguration_date, term_end_date),
+             linetype = "dashed", color = "black", alpha = 0.4) +
+  labs(title = "Monthly Post Frequency Over Time",
+       subtitle = "Yellow: Pre-Presidency | Red: Presidency | Blue: Post-Presidency",
+       x = "Year", y = "Number of Posts") +
+  theme_minimal()
+
+p_engage_trend <- ggplot(engagement_trends, aes(x = as.Date(month_yr), y = Count)) +
+  ggplot2::annotate("rect", xmin = start_date,        xmax = inauguration_date,
+                    ymin = -Inf, ymax = Inf, alpha = 0.15, fill = "#FFB347") +
+  ggplot2::annotate("rect", xmin = inauguration_date, xmax = term_end_date,
+                    ymin = -Inf, ymax = Inf, alpha = 0.15, fill = "#FF6961") +
+  ggplot2::annotate("rect", xmin = term_end_date,     xmax = end_date,
+                    ymin = -Inf, ymax = Inf, alpha = 0.15, fill = "#AEC6CF") +
+  geom_line(aes(color = Metric), linewidth = 0.8, alpha = 0.8) +
+  scale_y_log10(breaks = c(10, 100, 1000, 10000, 100000),
+                labels = label_comma(), expand = c(0, 0)) +
+  scale_color_manual(values = c("Likes" = "#E15759", "Retweets" = "#76B7B2")) +
+  labs(title = "Engagement Trends (Log Scale)",
+       subtitle = "Yellow: Pre-Presidency | Red: Presidency | Blue: Post-Presidency",
+       x = "Year", y = "Average Engagement Count") +
+  theme_minimal()
+
+grid.arrange(p_monthly, p_engage_trend, ncol = 1)
+```
+
+## 6.2 Candidacy Announcement (June 16, 2015)
+
+We compare engagement in the **month** and **year** before vs. after Trump announced his presidential candidacy.
+
+
+
+```{r candidacy-setup}
+announce_date <- as.Date("2015-06-16")
+pre_start  <- announce_date - 31
+pre_end    <- announce_date - 1
+post_start <- announce_date
+post_end   <- announce_date + 30
+
+pre_data  <- data %>% filter(.data$day >= pre_start  & .data$day <= pre_end)
+post_data <- data %>% filter(.data$day >= post_start & .data$day <= post_end)
+
+daily_pre  <- pre_data  %>% group_by(day) %>% summarise(n_posts = n(), .groups = "drop")
+daily_post <- post_data %>% group_by(day) %>% summarise(n_posts = n(), .groups = "drop")
+
+daily_pre  <- left_join(data.frame(day = seq(pre_start,  pre_end,  by = "day")), daily_pre,  by = "day") %>% mutate(n_posts = ifelse(is.na(n_posts), 0, n_posts))
+daily_post <- left_join(data.frame(day = seq(post_start, post_end, by = "day")), daily_post, by = "day") %>% mutate(n_posts = ifelse(is.na(n_posts), 0, n_posts))
+
+summary_month <- data.frame(
+  Metric = c("Likes (favorite_count)", "Retweets (repost_count)", "Daily Post Count"),
+  Pre_Mean  = round(c(mean(pre_data$favorite_count),  mean(pre_data$repost_count),  mean(daily_pre$n_posts)),  2),
+  Post_Mean = round(c(mean(post_data$favorite_count), mean(post_data$repost_count), mean(daily_post$n_posts)), 2),
+  p_value   = c(
+    t.test(pre_data$favorite_count,  post_data$favorite_count)$p.value,
+    t.test(pre_data$repost_count,    post_data$repost_count)$p.value,
+    t.test(daily_pre$n_posts,        daily_post$n_posts)$p.value
+  )
+)
+summary_month$Significant_0.05 <- ifelse(summary_month$p_value < 0.05, "Yes", "No")
+
+# Year window
+yr_pre_start  <- as.Date("2014-06-16"); yr_pre_end  <- as.Date("2015-06-15")
+yr_post_start <- as.Date("2015-06-16"); yr_post_end <- as.Date("2016-06-15")
+
+yr_pre_data  <- data %>% filter(day >= yr_pre_start  & day <= yr_pre_end)
+yr_post_data <- data %>% filter(day >= yr_post_start & day <= yr_post_end)
+
+yr_daily_pre  <- yr_pre_data  %>% group_by(day) %>% summarise(n_posts = n(), .groups = "drop")
+yr_daily_post <- yr_post_data %>% group_by(day) %>% summarise(n_posts = n(), .groups = "drop")
+
+yr_daily_pre  <- left_join(data.frame(day = seq(yr_pre_start,  yr_pre_end,  by = "day")), yr_daily_pre,  by = "day") %>% mutate(n_posts = ifelse(is.na(n_posts), 0, n_posts))
+yr_daily_post <- left_join(data.frame(day = seq(yr_post_start, yr_post_end, by = "day")), yr_daily_post, by = "day") %>% mutate(n_posts = ifelse(is.na(n_posts), 0, n_posts))
+
+summary_year <- data.frame(
+  Metric = c("Likes (favorite_count)", "Retweets (repost_count)", "Daily Post Count"),
+  Pre_Mean  = round(c(mean(yr_pre_data$favorite_count),  mean(yr_pre_data$repost_count),  mean(yr_daily_pre$n_posts)),  2),
+  Post_Mean = round(c(mean(yr_post_data$favorite_count), mean(yr_post_data$repost_count), mean(yr_daily_post$n_posts)), 2),
+  p_value   = c(
+    t.test(yr_pre_data$favorite_count,  yr_post_data$favorite_count)$p.value,
+    t.test(yr_pre_data$repost_count,    yr_post_data$repost_count)$p.value,
+    t.test(yr_daily_pre$n_posts,        yr_daily_post$n_posts)$p.value
+  )
+)
+summary_year$Significant_0.05 <- ifelse(summary_year$p_value < 0.05, "Yes", "No")
+
+summary_month$Window <- "Month"; summary_year$Window <- "Year"
+combined_cand <- rbind(summary_month, summary_year)[, c("Window","Metric","Pre_Mean","Post_Mean","p_value","Significant_0.05")]
+combined_cand
+```
+
+```{r candidacy-plots, fig.width=10, fig.height=4}
+cand_month <- bind_rows(
+  pre_data  %>% mutate(period = "Pre"),
+  post_data %>% mutate(period = "Post")
+)
+cand_month$period <- factor(cand_month$period, levels = c("Pre", "Post"))
+
+cand_year <- bind_rows(
+  yr_pre_data  %>% mutate(period = "Pre"),
+  yr_post_data %>% mutate(period = "Post")
+)
+cand_year$period <- factor(cand_year$period, levels = c("Pre", "Post"))
+
+bar_data <- summary_month %>%
+  filter(Metric != "Daily Post Count") %>%
+  select(Metric, Pre_Mean, Post_Mean) %>%
+  pivot_longer(cols = c(Pre_Mean, Post_Mean), names_to = "period", values_to = "Mean") %>%
+  mutate(period = factor(period, levels = c("Pre_Mean","Post_Mean"), labels = c("Pre","Post")))
+
+bar1 <- ggplot(bar_data %>% filter(Metric == "Likes (favorite_count)"),
+               aes(x = period, y = Mean, fill = period)) +
+  geom_bar(stat = "identity", color = "black", width = 0.6) +
+  scale_fill_manual(values = c("Pre" = "#AEC6CF", "Post" = "#FFB347")) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Mean Likes: Pre vs Post (Month)", x = "", y = "Average Likes") +
+  theme_minimal() + theme(legend.position = "none")
+
+bar2 <- ggplot(bar_data %>% filter(Metric == "Retweets (repost_count)"),
+               aes(x = period, y = Mean, fill = period)) +
+  geom_bar(stat = "identity", color = "black", width = 0.6) +
+  scale_fill_manual(values = c("Pre" = "#AEC6CF", "Post" = "#FFB347")) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Mean Retweets: Pre vs Post (Month)", x = "", y = "Average Retweets") +
+  theme_minimal() + theme(legend.position = "none")
+
+grid.arrange(bar1, bar2, ncol = 2)
+```
+
+```{r candidacy-boxplots, fig.width=10, fig.height=4}
+bx1 <- ggplot(cand_month, aes(x = period, y = favorite_count, fill = period)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("Pre" = "#AEC6CF", "Post" = "#FFB347")) +
+  labs(title = "Likes: Pre vs Post Announcement (Month)", x = "", y = "Likes") +
+  theme_minimal() + theme(legend.position = "none")
+
+bx2 <- ggplot(cand_month, aes(x = period, y = repost_count, fill = period)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("Pre" = "#AEC6CF", "Post" = "#FFB347")) +
+  labs(title = "Retweets: Pre vs Post Announcement (Month)", x = "", y = "Retweets") +
+  theme_minimal() + theme(legend.position = "none")
+
+bx3 <- ggplot(cand_year, aes(x = period, y = favorite_count, fill = period)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("Pre" = "#AEC6CF", "Post" = "#FFB347")) +
+  labs(title = "Likes: Pre vs Post Announcement (Year)", x = "", y = "Likes") +
+  theme_minimal() + theme(legend.position = "none")
+
+bx4 <- ggplot(cand_year, aes(x = period, y = repost_count, fill = period)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("Pre" = "#AEC6CF", "Post" = "#FFB347")) +
+  labs(title = "Retweets: Pre vs Post Announcement (Year)", x = "", y = "Retweets") +
+  theme_minimal() + theme(legend.position = "none")
+
+grid.arrange(bx1, bx2, bx3, bx4, ncol = 2)
+```
+
+## 6.3 2020 Election Loss (November 3, 2020)
+
+```{r election-setup}
+elec_date      <- as.Date("2020-11-03")
+elec_pre_start <- elec_date - 31; elec_pre_end  <- elec_date - 1
+elec_post_start <- elec_date;     elec_post_end <- elec_date + 30
+
+elec_pre_data  <- data %>% filter(day >= elec_pre_start  & day <= elec_pre_end)
+elec_post_data <- data %>% filter(day >= elec_post_start & day <= elec_post_end)
+
+elec_daily_pre  <- elec_pre_data  %>% group_by(day) %>% summarise(n_posts = n(), .groups = "drop")
+elec_daily_post <- elec_post_data %>% group_by(day) %>% summarise(n_posts = n(), .groups = "drop")
+elec_daily_pre  <- left_join(data.frame(day = seq(elec_pre_start,  elec_pre_end,  by = "day")), elec_daily_pre,  by = "day") %>% mutate(n_posts = ifelse(is.na(n_posts), 0, n_posts))
+elec_daily_post <- left_join(data.frame(day = seq(elec_post_start, elec_post_end, by = "day")), elec_daily_post, by = "day") %>% mutate(n_posts = ifelse(is.na(n_posts), 0, n_posts))
+
+summary_elec_month <- data.frame(
+  Metric = c("Likes (favorite_count)", "Retweets (repost_count)", "Daily Post Count"),
+  Pre_Mean  = round(c(mean(elec_pre_data$favorite_count),  mean(elec_pre_data$repost_count),  mean(elec_daily_pre$n_posts)),  2),
+  Post_Mean = round(c(mean(elec_post_data$favorite_count), mean(elec_post_data$repost_count), mean(elec_daily_post$n_posts)), 2),
+  p_value   = c(
+    t.test(elec_pre_data$favorite_count,  elec_post_data$favorite_count)$p.value,
+    t.test(elec_pre_data$repost_count,    elec_post_data$repost_count)$p.value,
+    t.test(elec_daily_pre$n_posts,        elec_daily_post$n_posts)$p.value
+  )
+)
+summary_elec_month$Significant_0.05 <- ifelse(summary_elec_month$p_value < 0.05, "Yes", "No")
+
+elec_yr_pre_start  <- as.Date("2019-11-03"); elec_yr_pre_end  <- as.Date("2020-11-02")
+elec_yr_post_start <- as.Date("2020-11-03"); elec_yr_post_end <- as.Date("2021-11-02")
+
+elec_yr_pre_data  <- data %>% filter(day >= elec_yr_pre_start  & day <= elec_yr_pre_end)
+elec_yr_post_data <- data %>% filter(day >= elec_yr_post_start & day <= elec_yr_post_end)
+
+elec_yr_daily_pre  <- elec_yr_pre_data  %>% group_by(day) %>% summarise(n_posts = n(), .groups = "drop")
+elec_yr_daily_post <- elec_yr_post_data %>% group_by(day) %>% summarise(n_posts = n(), .groups = "drop")
+elec_yr_daily_pre  <- left_join(data.frame(day = seq(elec_yr_pre_start,  elec_yr_pre_end,  by = "day")), elec_yr_daily_pre,  by = "day") %>% mutate(n_posts = ifelse(is.na(n_posts), 0, n_posts))
+elec_yr_daily_post <- left_join(data.frame(day = seq(elec_yr_post_start, elec_yr_post_end, by = "day")), elec_yr_daily_post, by = "day") %>% mutate(n_posts = ifelse(is.na(n_posts), 0, n_posts))
+
+summary_elec_year <- data.frame(
+  Metric = c("Likes (favorite_count)", "Retweets (repost_count)", "Daily Post Count"),
+  Pre_Mean  = round(c(mean(elec_yr_pre_data$favorite_count),  mean(elec_yr_pre_data$repost_count),  mean(elec_yr_daily_pre$n_posts)),  2),
+  Post_Mean = round(c(mean(elec_yr_post_data$favorite_count), mean(elec_yr_post_data$repost_count), mean(elec_yr_daily_post$n_posts)), 2),
+  p_value   = c(
+    t.test(elec_yr_pre_data$favorite_count,  elec_yr_post_data$favorite_count)$p.value,
+    t.test(elec_yr_pre_data$repost_count,    elec_yr_post_data$repost_count)$p.value,
+    t.test(elec_yr_daily_pre$n_posts,        elec_yr_daily_post$n_posts)$p.value
+  )
+)
+summary_elec_year$Significant_0.05 <- ifelse(summary_elec_year$p_value < 0.05, "Yes", "No")
+
+summary_elec_month$Window <- "Month"; summary_elec_year$Window <- "Year"
+combined_elec <- rbind(summary_elec_month, summary_elec_year)[, c("Window","Metric","Pre_Mean","Post_Mean","p_value","Significant_0.05")]
+combined_elec
+```
+
+```{r election-plots, fig.width=8, fig.height=6}
+elec_month <- bind_rows(
+  elec_pre_data  %>% mutate(period = "Pre"),
+  elec_post_data %>% mutate(period = "Post")
+)
+elec_month$period <- factor(elec_month$period, levels = c("Pre","Post"))
+
+elec_daily_all <- elec_month %>%
+  group_by(day, period) %>%
+  summarise(mean_likes = mean(favorite_count), mean_retweets = mean(repost_count), n_posts = n(), .groups = "drop")
+
+p7 <- ggplot(elec_daily_all, aes(x = day, y = mean_likes)) +
+  geom_line(color = "steelblue", linewidth = 0.7) +
+  geom_point(color = "steelblue", size = 1.2) +
+  geom_vline(xintercept = as.numeric(elec_date), linetype = "dashed", color = "red") +
+  ggplot2::annotate("text", x = elec_date, y = Inf, label = "Election day", vjust = 2, hjust = -0.1, color = "red", size = 3.5) +
+  labs(title = "Daily Mean Likes Around 2020 Election Loss (Month)", x = "Date", y = "Mean Likes") +
+  theme_minimal()
+
+p8 <- ggplot(elec_daily_all, aes(x = day, y = mean_retweets)) +
+  geom_line(color = "darkorange", linewidth = 0.7) +
+  geom_point(color = "darkorange", size = 1.2) +
+  geom_vline(xintercept = as.numeric(elec_date), linetype = "dashed", color = "red") +
+  ggplot2::annotate("text", x = elec_date, y = Inf, label = "Election day", vjust = 2, hjust = -0.1, color = "red", size = 3.5) +
+  labs(title = "Daily Mean Retweets Around 2020 Election Loss (Month)", x = "Date", y = "Mean Retweets") +
+  theme_minimal()
+
+p9 <- ggplot(elec_daily_all, aes(x = day, y = n_posts)) +
+  geom_line(color = "forestgreen", linewidth = 0.7) +
+  geom_point(color = "forestgreen", size = 1.2) +
+  geom_vline(xintercept = as.numeric(elec_date), linetype = "dashed", color = "red") +
+  ggplot2::annotate("text", x = elec_date, y = Inf, label = "Election day", vjust = 2, hjust = -0.1, color = "red", size = 3.5) +
+  labs(title = "Daily Post Count Around 2020 Election Loss (Month)", x = "Date", y = "Number of Posts") +
+  theme_minimal()
+
+print(p7); print(p8); print(p9)
+```
+
+```{r election-boxplots, fig.width=10, fig.height=8}
+elec_year <- bind_rows(
+  elec_yr_pre_data  %>% mutate(period = "Pre"),
+  elec_yr_post_data %>% mutate(period = "Post")
+)
+elec_year$period <- factor(elec_year$period, levels = c("Pre","Post"))
+
+elec_year$week <- floor_date(elec_year$day, "week")
+elec_weekly <- elec_year %>%
+  group_by(week) %>%
+  summarise(mean_likes = mean(favorite_count), mean_retweets = mean(repost_count), n_posts = n(), .groups = "drop")
+
+bx5 <- ggplot(elec_month, aes(x = period, y = favorite_count, fill = period)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("Pre" = "#AEC6CF", "Post" = "#FFB347")) +
+  labs(title = "Likes: Pre vs Post Election (Month)", x = "", y = "Likes") +
+  theme_minimal() + theme(legend.position = "none")
+
+bx6 <- ggplot(elec_month, aes(x = period, y = repost_count, fill = period)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("Pre" = "#AEC6CF", "Post" = "#FFB347")) +
+  labs(title = "Retweets: Pre vs Post Election (Month)", x = "", y = "Retweets") +
+  theme_minimal() + theme(legend.position = "none")
+
+bx7 <- ggplot(elec_year, aes(x = period, y = favorite_count, fill = period)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("Pre" = "#AEC6CF", "Post" = "#FFB347")) +
+  labs(title = "Likes: Pre vs Post Election (Year)", x = "", y = "Likes") +
+  theme_minimal() + theme(legend.position = "none")
+
+bx8 <- ggplot(elec_year, aes(x = period, y = repost_count, fill = period)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("Pre" = "#AEC6CF", "Post" = "#FFB347")) +
+  labs(title = "Retweets: Pre vs Post Election (Year)", x = "", y = "Retweets") +
+  theme_minimal() + theme(legend.position = "none")
+
+grid.arrange(bx5, bx6, bx7, bx8, ncol = 2)
+```
+
+## 6.4 Presidency Era Analysis
+
+```{r era-analysis}
+term_data <- data %>%
+  mutate(period = case_when(
+    day < inauguration_date ~ "Pre–Presidency",
+    day >= inauguration_date & day <= term_end_date ~ "Presidency",
+    day > term_end_date ~ "Post–Presidency"
+  )) %>%
+  mutate(period = factor(period, levels = c("Post–Presidency", "Pre–Presidency", "Presidency")))
+
+era_summary <- term_data %>%
+  group_by(period) %>%
+  summarise(
+    total_posts    = n(),
+    mean_likes     = mean(favorite_count, na.rm = TRUE),
+    median_likes   = median(favorite_count, na.rm = TRUE),
+    mean_retweets  = mean(repost_count,   na.rm = TRUE),
+    .groups = "drop"
+  )
+
+era_summary
+```
+
+```{r era-plot, fig.width=10, fig.height=5}
+era_plot_data <- term_data %>%
+  filter(!is.na(period)) %>%
+  select(period, favorite_count, repost_count) %>%
+  pivot_longer(cols = c(favorite_count, repost_count), names_to = "Metric", values_to = "Count") %>%
+  mutate(Metric = ifelse(Metric == "favorite_count", "Likes", "Retweets"))
+
+ggplot(era_plot_data, aes(x = period, y = Count, fill = period)) +
+  geom_boxplot(outlier.alpha = 0.1, lwd = 0.5) +
+  scale_y_log10(breaks = c(1, 10, 100, 1000, 10000, 100000, 1000000),
+                labels = label_comma()) +
+  facet_wrap(~Metric, scales = "free_y") +
+  scale_fill_manual(values = c("Post–Presidency" = "#AEC6CF",
+                               "Pre–Presidency"  = "#FFB347",
+                               "Presidency"      = "#FF6961")) +
+  labs(title = "Engagement Distribution by Political Era",
+       subtitle = "Log scale used to compare different orders of magnitude",
+       x = "Era", y = "Count (Log Scale)") +
+  theme_minimal() +
+  theme(legend.position = "none", strip.text = element_text(face = "bold"))
+```
+
+## 6.5 January 6th & Platform Transition
+
+```{r jan6-analysis, fig.width=10, fig.height=8, warning=FALSE}
+jan6_date       <- as.Date("2021-01-06")
+suspension_date <- as.Date("2021-01-08")
+ts_return_date  <- as.Date("2022-02-14")
+
+daily_trends <- data %>%
+  filter(day >= as.Date("2020-10-01") & day <= as.Date("2022-06-01")) %>%
+  group_by(day) %>%
+  summarise(post_count = n(), avg_likes = mean(favorite_count, na.rm = TRUE),
+            avg_reposts = mean(repost_count, na.rm = TRUE), .groups = "drop")
+
+p_freq <- ggplot(daily_trends, aes(x = day, y = post_count)) +
+  ggplot2::annotate("rect", xmin = suspension_date, xmax = ts_return_date,
+           ymin = -Inf, ymax = Inf, alpha = 0.1, fill = "red") +
+  geom_line(color = "#2c3e50", linewidth = 1) +
+  geom_vline(xintercept = jan6_date, linetype = "dashed", color = "#c0392b", linewidth = 1) +
+  scale_y_continuous(limits = c(0, 60), breaks = seq(0, 60, by = 10)) +
+  ggplot2::annotate("label", x = jan6_date + 120, y = 50, label = "Twitter Suspension Period",
+           color = "#c0392b", fontface = "bold", size = 4, fill = "white") +
+  labs(title = "Post Frequency Surrounding January 6th",
+       subtitle = "Activity surge leading to Jan 6th followed by platform hiatus",
+       x = NULL, y = "Daily Post Count") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", size = 16), panel.grid.minor = element_blank())
+
+p_engage2 <- ggplot(daily_trends, aes(x = day)) +
+  ggplot2::annotate("rect", xmin = suspension_date, xmax = ts_return_date,
+           ymin = -Inf, ymax = Inf, alpha = 0.1, fill = "red") +
+  geom_line(aes(y = avg_likes,   color = "Avg Likes"),   linewidth = 1) +
+  geom_line(aes(y = avg_reposts, color = "Avg Retweets"), linewidth = 1) +
+  geom_vline(xintercept = jan6_date, linetype = "dashed", color = "#c0392b", linewidth = 1) +
+  scale_y_log10(limits = c(100, 1000000),
+                breaks  = c(100, 1000, 10000, 50000, 100000, 250000, 500000, 1000000),
+                labels  = comma_format()) +
+  scale_color_manual(values = c("Avg Likes" = "#1a5276", "Avg Retweets" = "#d35400")) +
+  labs(x = "Timeline", y = "Engagement Count (Log Scale)", color = "Metric") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom", legend.title = element_blank(), panel.grid.minor = element_blank())
+
+grid.arrange(p_freq, p_engage2, ncol = 1, heights = c(1, 1))
+```
+
+```{r jan6-boxplots, fig.width=10, fig.height=5}
+jan_data <- data %>% mutate(is_post_jan6 = day >= jan6_date)
+
+jan6_summary <- jan_data %>%
+  group_by(is_post_jan6) %>%
+  summarise(total_posts = n(), mean_likes = mean(favorite_count, na.rm = TRUE),
+            mean_retweets = mean(repost_count, na.rm = TRUE), .groups = "drop")
+jan6_summary
+
+jan6_plot_data <- jan_data %>%
+  select(is_post_jan6, favorite_count, repost_count) %>%
+  pivot_longer(cols = c(favorite_count, repost_count), names_to = "Metric", values_to = "Count") %>%
+  mutate(Metric = ifelse(Metric == "favorite_count", "Likes", "Retweets"),
+         is_post_jan6 = ifelse(is_post_jan6, "Post-Jan 6th", "Pre-Jan 6th"))
+
+ggplot(jan6_plot_data, aes(x = is_post_jan6, y = Count, fill = is_post_jan6)) +
+  geom_boxplot(outlier.alpha = 0.1) +
+  scale_y_log10(breaks = c(1, 10, 100, 1000, 10000, 100000, 1000000), labels = label_comma()) +
+  facet_wrap(~Metric) +
+  scale_fill_manual(values = c("Pre-Jan 6th" = "#4E79A7", "Post-Jan 6th" = "#E15759")) +
+  labs(title = "Engagement Before vs. After January 6th",
+       subtitle = "Comparing the spread of likes and retweets (Log Scale)", x = "", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none", strip.text = element_text(face = "bold"))
+```
+
+---
+
+# 7. Text Classification via OpenAI Embeddings
+
+> **Note:** The code in this section calls the OpenAI API and was run once to produce the labeled datasets (`tweet_themes_with_sentiment.csv` and `20k_tweet_themes_with_sentiment.csv`). The API chunks are shown for reproducibility but are set to `eval=FALSE` by default to avoid re-incurring API costs. Load the pre-computed CSVs directly for all downstream analysis.
+
+## 7.1 Methodology
+
+Tweets were embedded using OpenAI's `text-embedding-3-small` model. Each tweet was then classified by computing **cosine similarity** against averaged anchor embeddings for 11 themes, with the highest-similarity theme assigned as the label.
+
+Themes: `immigration`, `education`, `war`, `crime`, `religion`, `jobs`, `poverty`, `democrats`, `Government assistance programs`, `healthcare`, `none`
+
+```{python classification-api, eval=FALSE}
+# NOTE: Requires a valid OPENAI_API_KEY in a .env file
+# This chunk is eval=FALSE — use the pre-computed CSV files instead
+
+from openai import OpenAI
+from dotenv import load_dotenv
+import os, numpy as np, pandas as pd, pickle, time
+from openai import RateLimitError
+from sklearn.metrics.pairwise import cosine_similarity
+
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Load pre-processed data
+df_py = pd.read_csv("preprocessed_trump_dat.csv")
+df_py = df_py.drop(columns=["Unnamed: 0","X","X.1"], errors="ignore")
+df_py["text_clean"] = df_py["text_clean"].astype(str)
+df_py["text_clean"] = df_py["text_clean"].replace("nan", np.nan)
+df_py = df_py.dropna(subset=["text_clean"])
+
+# Sample 20k tweets
+df_samp = df_py.sample(n=20000, random_state=42)
+
+# Batch embed
+def get_embeddings_batch(texts, batch_size=250):
+    embeddings = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        while True:
+            try:
+                resp = client.embeddings.create(model="text-embedding-3-small", input=batch)
+                embeddings.extend([d.embedding for d in resp.data])
+                time.sleep(2); break
+            except RateLimitError:
+                time.sleep(30)
+    return embeddings
+
+texts = df_samp["text_clean"].tolist()
+embeddings = get_embeddings_batch(texts)
+with open("embeddings.pkl", "wb") as f: pickle.dump(embeddings, f)
+
+# Theme anchors and cosine similarity classification (see TrumpClassification.Rmd for full anchor text)
+# ... (anchor definitions omitted here for brevity; see original file)
+# df_samp["theme_label"] = labels
+# df_samp.to_csv("trump_sample_labeled.csv", index=False)
+```
+
+## 7.2 Load Labeled Data & Confidence Summary
+
+```{r load-labeled}
+# Load the 20k labeled sample (pre-computed)
+df_labeled <- df_20k
+
+cat("Unique themes:\n")
+print(unique(df_labeled$theme_label))
+```
+
+```{r confidence-summary}
+confidence_summary <- df_labeled %>%
+  group_by(theme_label) %>%
+  summarise(
+    n               = n(),
+    mean_confidence = mean(confidence, na.rm = TRUE),
+    sd_confidence   = sd(confidence,  na.rm = TRUE),
+    min_confidence  = min(confidence, na.rm = TRUE),
+    max_confidence  = max(confidence, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_confidence))
+
+confidence_summary
+```
+
+```{r confidence-plot, fig.width=9, fig.height=5}
+ggplot(confidence_summary, aes(x = reorder(theme_label, mean_confidence), y = mean_confidence)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Average Model Confidence by Theme", x = "Theme", y = "Mean Confidence") +
+  theme_minimal()
+```
+
+Immigration produces the highest confidence — its vocabulary is highly specific, repetitive, and minimally overlapping with other themes.
+
+## 7.3 High-Confidence Examples
+
+
+```{r high-confidence}
+df_labeled %>%
+  arrange(desc(confidence)) %>%
+  select(theme_label, confidence, text_clean) %>%
+  slice_head(n = 5)
+```
+
+```{r top3-per-theme}
+df_labeled %>%
+  group_by(theme_label) %>%
+  arrange(desc(confidence), .by_group = TRUE) %>%
+  slice_head(n = 3) %>%
+  select(theme_label, confidence, text_clean)
+```
+
+## 7.4 Sentiment by Theme
+
+```{r sentiment-by-theme}
+# Ensure sentiment column exists; run VADER if not
+if (!"sentiment" %in% colnames(df_labeled)) {
+  vader_theme <- vader_df(df_labeled$text_clean)
+  df_labeled  <- bind_cols(df_labeled, vader_theme) %>% rename(sentiment = compound)
+}
+
+df_labeled <- df_labeled %>%
+  mutate(theme_label = fct_reorder(theme_label, sentiment, .fun = mean))
+
+ggplot(df_labeled, aes(x = theme_label, y = sentiment, fill = theme_label)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.15) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3, fill = "white") +
+  labs(title = "Sentiment Distribution by Theme",
+       subtitle = "White diamonds = mean sentiment",
+       x = "Theme", y = "Sentiment Score") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 30, hjust = 1),
+        plot.title = element_text(face = "bold"))
+```
+
+```{r favorites-by-theme, warning=FALSE}
+df_labeled <- df_labeled %>%
+  mutate(theme_label = fct_reorder(theme_label, favorite_count, .fun = mean))
+
+ggplot(df_labeled, aes(x = theme_label, y = favorite_count, fill = theme_label)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.15) +
+  scale_y_log10() +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3, fill = "white") +
+  labs(title = "Favorites Distribution by Theme",
+       subtitle = "White diamonds = mean favorites",
+       x = "Theme", y = "Number of Favorites (Log Scale)") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 30, hjust = 1),
+        plot.title = element_text(face = "bold"))
+```
+
+---
+
+# 8. Virality Modeling
+
+We define **viral** as a tweet in the **top 5%** by likes OR retweets. We model virality using both tweet-level stylistic features (Section 8.1) and theme/sentiment predictors (Section 8.2).
+
+```{r}
+test <- df_20k
+
+test$viral <- (test$favorite_count > quantile(test$favorite_count, 0.95)) | (test$repost_count > quantile(test$repost_count, 0.95))
+table(test$viral, test$theme_label)
+
+# Make sure viral is numeric 0/1
+test <- test %>%
+  mutate(viral = as.integer(viral))
+
+
+# -----------------------------
+# 2. Basic cleaning
+# -----------------------------
+model_df <- test %>%
+  mutate(
+    theme_label  = as.factor(theme_label),
+    platform     = as.factor(platform),
+    deleted_flag = as.factor(deleted_flag),
+
+    # Count hashtags if the hashtags column is text-like rather than numeric
+    hashtags_num = case_when(
+      is.numeric(hashtags) ~ as.numeric(hashtags),
+      TRUE ~ str_count(coalesce(as.character(hashtags), ""), "#")
+    ),
+
+    # Count URLs if urls is text-like
+    urls_num = case_when(
+      is.numeric(urls) ~ as.numeric(urls),
+      TRUE ~ ifelse(is.na(urls) | urls == "", 0,
+                    str_count(as.character(urls), "http|www|t\\.co"))
+    ),
+
+    # Count mentions if user_mentions is text-like
+    mentions_num = case_when(
+      is.numeric(user_mentions) ~ as.numeric(user_mentions),
+      TRUE ~ str_count(coalesce(as.character(user_mentions), ""), "@")
+    ),
+
+    media_count = as.numeric(media_count),
+    word_count  = as.numeric(word_count),
+    confidence  = as.numeric(confidence),
+    sentiment   = as.numeric(sentiment),
+    pos         = as.numeric(pos),
+    neu         = as.numeric(neu),
+    neg         = as.numeric(neg),
+    but_count   = as.numeric(but_count),
+    favorite_count = as.numeric(favorite_count),
+    repost_count   = as.numeric(repost_count)
+  ) %>%
+  filter(
+    !is.na(viral),
+    !is.na(theme_label),
+    !is.na(sentiment),
+    !is.na(word_count),
+    !is.na(platform)
+  )
+
+# Optional: collapse very rare themes if needed
+# model_df <- model_df %>%
+#   mutate(theme_label = fct_lump_min(theme_label, min = 20))
+
+# -----------------------------
+# 3. Quick exploratory checks
+# -----------------------------
+# Viral rate by theme
+model_df %>%
+  group_by(theme_label) %>%
+  summarise(
+    n = n(),
+    viral_rate = mean(viral, na.rm = TRUE),
+    avg_favorites = mean(favorite_count, na.rm = TRUE)
+  ) %>%
+  arrange(desc(viral_rate)) %>%
+  print(n = Inf)
+
+# -----------------------------
+# 4. Train/test split
+# -----------------------------
+set.seed(123)
+
+train_index <- createDataPartition(model_df$viral, p = 0.8, list = FALSE)
+
+train_df <- model_df[train_index, ]
+test_df  <- model_df[-train_index, ]
+
+# -----------------------------
+# 5. Full model
+# -----------------------------
+# Note:
+# Use either sentiment OR pos/neu/neg together, but not both unless
+# you are sure they are not collinear. Sentiment is the cleaner choice.
+
+model_full <- glm(
+  viral ~ theme_label + sentiment + word_count +
+    hashtags_num + urls_num + mentions_num + media_count +
+    confidence + but_count + platform + deleted_flag,
+  data = train_df,
+  family = binomial()
+)
+
+summary(model_full)
+
+# Odds ratios
+full_or <- broom::tidy(model_full, conf.int = TRUE, exponentiate = TRUE)
+print(full_or, n = Inf)
+
+# -----------------------------
+# 6. Reduced model
+# -----------------------------
+# This is the simpler "main story" model
+model_reduced <- glm(
+  viral ~ theme_label + sentiment,
+  data = train_df,
+  family = binomial()
+)
+
+summary(model_reduced)
+
+reduced_or <- broom::tidy(model_reduced, conf.int = TRUE, exponentiate = TRUE)
+print(reduced_or, n = Inf)
+
+# -----------------------------
+# 7. Compare full vs reduced
+# -----------------------------
+anova(model_reduced, model_full, test = "Chisq")
+
+# If this test is not significant, you can justify keeping the simpler model.
+
+# -----------------------------
+# 8. Interaction model
+# -----------------------------
+# This checks whether sentiment matters differently by theme
+model_interaction <- glm(
+  viral ~ theme_label * sentiment + word_count +
+    hashtags_num + urls_num + mentions_num + media_count +
+    confidence + but_count + platform + deleted_flag,
+  data = train_df,
+  family = binomial()
+)
+
+summary(model_interaction)
+
+interaction_or <- broom::tidy(model_interaction, conf.int = TRUE, exponentiate = TRUE)
+print(interaction_or, n = Inf)
+
+# Compare interaction vs full
+anova(model_full, model_interaction, test = "Chisq")
+
+# -----------------------------
+# 9. Predicted probabilities on test set
+# -----------------------------
+test_df <- test_df %>%
+  mutate(
+    prob_full        = predict(model_full, newdata = test_df, type = "response"),
+    prob_reduced     = predict(model_reduced, newdata = test_df, type = "response"),
+    prob_interaction = predict(model_interaction, newdata = test_df, type = "response")
+  )
+
+# -----------------------------
+# 10. ROC / AUC
+# -----------------------------
+roc_full <- roc(test_df$viral, test_df$prob_full)
+roc_reduced <- roc(test_df$viral, test_df$prob_reduced)
+roc_interaction <- roc(test_df$viral, test_df$prob_interaction)
+
+auc(roc_full)
+auc(roc_reduced)
+auc(roc_interaction)
+
+plot(roc_full, main = "ROC Curve - Virality Models")
+plot(roc_reduced, add = TRUE, lty = 2)
+plot(roc_interaction, add = TRUE, lty = 3)
+legend(
+  "bottomright",
+  legend = c(
+    paste0("Full AUC = ", round(auc(roc_full), 3)),
+    paste0("Reduced AUC = ", round(auc(roc_reduced), 3)),
+    paste0("Interaction AUC = ", round(auc(roc_interaction), 3))
+  ),
+  lty = c(1, 2, 3),
+  bty = "n"
+)
+
+# -----------------------------
+# 11. Classification metrics
+# -----------------------------
+# Default threshold = 0.5 may be too harsh for rare-event data
+# You can also try threshold = prevalence or choose from ROC
+
+threshold <- 0.5
+
+test_df <- test_df %>%
+  mutate(
+    pred_full = ifelse(prob_full >= threshold, 1, 0),
+    pred_reduced = ifelse(prob_reduced >= threshold, 1, 0),
+    pred_interaction = ifelse(prob_interaction >= threshold, 1, 0)
+  )
+
+confusionMatrix(
+  factor(test_df$pred_full),
+  factor(test_df$viral),
+  positive = "1"
+)
+
+confusionMatrix(
+  factor(test_df$pred_reduced),
+  factor(test_df$viral),
+  positive = "1"
+)
+
+confusionMatrix(
+  factor(test_df$pred_interaction),
+  factor(test_df$viral),
+  positive = "1"
+)
+
+# -----------------------------
+# 12. Visualize predicted virality by theme
+# -----------------------------
+theme_pred <- test_df %>%
+  group_by(theme_label) %>%
+  summarise(
+    mean_pred_prob = mean(prob_reduced, na.rm = TRUE),
+    actual_viral_rate = mean(viral, na.rm = TRUE),
+    n = n()
+  ) %>%
+  arrange(desc(mean_pred_prob))
+
+print(theme_pred, n = Inf)
+
+ggplot(theme_pred, aes(x = reorder(theme_label, mean_pred_prob), y = mean_pred_prob)) +
+  geom_col() +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Predicted Probability of Virality by Theme",
+    x = "Theme",
+    y = "Average Predicted Probability"
+  )
+
+# -----------------------------
+# 13. Visualize sentiment effect
+# -----------------------------
+ggplot(test_df, aes(x = sentiment, y = prob_reduced, color = theme_label)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(se = FALSE, method = "loess") +
+  theme_minimal() +
+  labs(
+    title = "Predicted Virality vs Sentiment",
+    x = "Sentiment",
+    y = "Predicted Probability of Virality",
+    color = "Theme"
+  )
+
+# -----------------------------
+# 14. Nice summary table for report
+# -----------------------------
+report_tbl <- reduced_or %>%
+  select(term, estimate, conf.low, conf.high, p.value) %>%
+  arrange(p.value)
+
+print(report_tbl, n = Inf)
+
+```
+
+# Clustering
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(text2vec)
+library(irlba)
+library(Matrix)
+
+set.seed(42)
+
+data_sentiment <- read.csv("trump_tweets_with_sentiment.csv", stringsAsFactors = FALSE)
+data_theme <- read.csv("trump_data.csv", stringsAsFactors = FALSE)
+
+# Append theme_label from trump_data.csv by joining on date
+data2 <- merge(data_sentiment, data_theme[, c("date", "theme_label")], by = "date", all.x = TRUE)
+colnames(data2)
+nrow(data2)
+```
+
+## Word Score Aggregation
+
+```{r word-score-aggregation}
+library(purrr)
+
+# Parse word_scores from string "{0, 1.3, -0.8, ...}" to numeric vector
+parse_word_scores <- function(x) {
+  x <- gsub("[{}]", "", x)
+  as.numeric(strsplit(trimws(x), ",\\s*")[[1]])
+}
+
+data2$word_scores_parsed <- lapply(data2$word_scores, parse_word_scores)
+
+data2 <- data2 %>%
+  mutate(
+    # Central tendency
+    word_score_mean   = map_dbl(word_scores_parsed, ~ mean(.x, na.rm = TRUE)),
+    word_score_median = map_dbl(word_scores_parsed, ~ median(.x, na.rm = TRUE)),
+
+    # Spread / emotional variance
+    word_score_sd    = map_dbl(word_scores_parsed, ~ {
+      s <- sd(.x, na.rm = TRUE); if (is.na(s)) 0 else s
+    }),
+    word_score_range = map_dbl(word_scores_parsed, ~ {
+      r <- range(.x, na.rm = TRUE); r[2] - r[1]
+    }),
+
+    # Extremity
+    word_score_max     = map_dbl(word_scores_parsed, ~ max(.x, na.rm = TRUE)),
+    word_score_min     = map_dbl(word_scores_parsed, ~ min(.x, na.rm = TRUE)),
+    word_score_abs_max = map_dbl(word_scores_parsed, ~ max(abs(.x), na.rm = TRUE)),
+
+    # Proportion of charged words
+    prop_positive_words = map_dbl(word_scores_parsed, ~ mean(.x > 0.1, na.rm = TRUE)),
+    prop_negative_words = map_dbl(word_scores_parsed, ~ mean(.x < -0.1, na.rm = TRUE)),
+    prop_neutral_words  = map_dbl(word_scores_parsed, ~ mean(abs(.x) <= 0.1, na.rm = TRUE)),
+
+    # Emotional conflict — high value means tweet mixes pos and neg strongly
+    sentiment_conflict = map_dbl(word_scores_parsed, ~ {
+      pos <- mean(.x[.x > 0.1])
+      neg <- mean(abs(.x[.x < -0.1]))
+      if (is.nan(pos) | is.nan(neg)) return(0)
+      (pos + neg) / 2
+    })
+  )
+
+cat("Word score features added. Sample:\n")
+data2 %>%
+  select(word_score_mean, word_score_sd, word_score_abs_max,
+         prop_negative_words, sentiment_conflict) %>%
+  head(5)
+```
+
+## Character N-gram TF-IDF
+
+```{r char-ngram-tfidf}
+# Character-level tokenizer
+# Replaces whitespace with _ so word-boundary patterns are captured as n-grams
+# Keeps original case so capitalization habits become part of the signal
+char_tokenizer <- function(x) {
+  x <- gsub("\\s+", "_", x)
+  strsplit(x, "")
+}
+
+# Build vocabulary of character 3- to 5-grams
+it    <- itoken(data2$text, tokenizer = char_tokenizer, progressbar = TRUE)
+vocab <- create_vocabulary(it, ngram = c(ngram_min = 3L, ngram_max = 5L))
+cat("Raw vocabulary size:", nrow(vocab), "\n")
+
+# Prune rare & ubiquitous n-grams
+vocab <- prune_vocabulary(vocab,
+                          term_count_min      = 10,
+                          doc_proportion_max  = 0.95,
+                          doc_proportion_min  = 0.001)
+cat("Pruned vocabulary size:", nrow(vocab), "\n")
+
+# TF-IDF weighted document-term matrix
+vectorizer <- vocab_vectorizer(vocab)
+it         <- itoken(data2$text, tokenizer = char_tokenizer, progressbar = FALSE)
+dtm        <- create_dtm(it, vectorizer)
+tfidf_mod  <- TfIdf$new()
+dtm_tfidf  <- fit_transform(dtm, tfidf_mod)
+cat("TF-IDF matrix:", nrow(dtm_tfidf), "docs x", ncol(dtm_tfidf), "features\n")
+```
+
+```{r svd-reduction}
+# Truncated SVD to 50 components
+n_comp     <- 50
+svd_result <- irlba(dtm_tfidf, nv = n_comp)
+tfidf_svd  <- svd_result$u %*% diag(svd_result$d)
+
+cat("SVD embedding:", nrow(tfidf_svd), "x", ncol(tfidf_svd), "\n")
+```
+
+## UMAP + Feature Combination & Clustering
+
+```{r derive-counts}
+library(uwot)
+library(dbscan)
+library(ggplot2)
+
+# Derive count features from pipe-delimited string columns
+data2 <- data2 %>%
+  mutate(
+    hashtag_count = ifelse(is.na(hashtags) | hashtags == "nan" | hashtags == "", 0,
+                           sapply(strsplit(hashtags, "\\|"), length)),
+    url_count     = ifelse(is.na(urls) | urls == "nan" | urls == "", 0,
+                           sapply(strsplit(urls, "\\|"), length)),
+    mention_count = ifelse(is.na(user_mentions) | user_mentions == "nan" | user_mentions == "", 0,
+                           sapply(strsplit(user_mentions, "\\|"), length))
+  )
+```
+
+```{r umap-ngrams}
+# Higher-dim UMAP for clustering (preserves more structure than 2D)
+umap_cluster <- umap(tfidf_svd,
+                     n_neighbors  = 30,
+                     min_dist     = 0.1,
+                     n_components = 10,
+                     metric       = "euclidean",
+                     n_threads    = 4,
+                     verbose      = FALSE)
+
+# 2D UMAP for visualization only
+umap_viz <- umap(tfidf_svd,
+                 n_neighbors  = 30,
+                 min_dist     = 0.1,
+                 n_components = 2,
+                 metric       = "euclidean",
+                 n_threads    = 4,
+                 verbose      = FALSE)
+
+cat("UMAP for clustering:", nrow(umap_cluster), "x", ncol(umap_cluster), "\n")
+cat("UMAP for viz:", nrow(umap_viz), "x", ncol(umap_viz), "\n")
+```
+
+```{r combine-features}
+# Selected numeric features
+extra_cols <- c("word_count", "media_count", "hashtag_count", "url_count",
+                "mention_count", "vader_compound", "vader_negative", "but_count",
+                "word_score_sd", "word_score_abs_max", "sentiment_conflict",
+                "prop_negative_words")
+
+extra_mat <- as.matrix(data2[, extra_cols])
+extra_mat[is.na(extra_mat)] <- 0
+
+# Z-score normalize each block so no feature dominates by scale
+norm_block <- function(mat) {
+  m <- scale(mat, center = TRUE, scale = TRUE)
+  m[is.nan(m)] <- 0
+  m
+}
+
+umap_z  <- norm_block(umap_cluster)
+extra_z <- norm_block(extra_mat)
+
+# Combine 10D UMAP n-gram features with engineered features
+combo <- cbind(umap_z, extra_z)
+cat("Combined feature matrix:", nrow(combo), "x", ncol(combo), "\n")
+```
+
+```{r hdbscan-clustering, fig.width=10, fig.height=7}
+# DBSCAN — HDBSCAN crashes on ~56k rows (builds full pairwise distance matrix ~25GB)
+knn_k     <- 130
+knn_dists <- kNNdist(combo, k = knn_k)
+eps_val   <- quantile(knn_dists, 0.88)
+
+hdb <- dbscan(combo, eps = eps_val, minPts = knn_k)
+
+cat("Clusters found:", max(hdb$cluster), "\n")
+cat("Noise points:", sum(hdb$cluster == 0), "\n")
+print(table(Cluster = hdb$cluster))
+
+data2$cluster <- hdb$cluster
+
+ggplot(data.frame(U1 = umap_viz[,1], U2 = umap_viz[,2],
+                  Cluster = as.factor(hdb$cluster)),
+       aes(U1, U2, color = Cluster)) +
+  geom_point(alpha = 0.25, size = 0.4) +
+  scale_color_brewer(palette = "Set2") +
+  labs(title = "HDBSCAN Clustering: N-gram UMAP + Engineered Features",
+       subtitle = paste(max(hdb$cluster), "clusters,",
+                        sum(hdb$cluster == 0), "noise pts")) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+## Cluster Evaluation
+
+```{r cluster-profiles}
+library(lubridate)
+
+cluster_summary <- data2 %>%
+  filter(cluster > 0) %>%
+  group_by(cluster) %>%
+  summarise(
+    n                    = n(),
+    avg_likes            = round(mean(favorite_count, na.rm = TRUE), 0),
+    median_likes         = round(median(favorite_count, na.rm = TRUE), 0),
+    avg_retweets         = round(mean(repost_count, na.rm = TRUE), 0),
+    median_retweets      = round(median(repost_count, na.rm = TRUE), 0),
+    avg_word_count       = round(mean(word_count, na.rm = TRUE), 1),
+    avg_vader_compound   = round(mean(vader_compound, na.rm = TRUE), 3),
+    avg_vader_negative   = round(mean(vader_negative, na.rm = TRUE), 3),
+    avg_word_score_sd    = round(mean(word_score_sd, na.rm = TRUE), 3),
+    avg_sentiment_conflict = round(mean(sentiment_conflict, na.rm = TRUE), 3),
+    pct_has_url          = round(mean(url_count > 0, na.rm = TRUE) * 100, 1),
+    pct_has_hashtag      = round(mean(hashtag_count > 0, na.rm = TRUE) * 100, 1),
+    pct_has_mention      = round(mean(mention_count > 0, na.rm = TRUE) * 100, 1),
+    avg_but_count        = round(mean(but_count, na.rm = TRUE), 2),
+    earliest_date        = as.character(min(as.POSIXct(date, format = "%Y-%m-%d %H:%M:%S"), na.rm = TRUE)),
+    latest_date          = as.character(max(as.POSIXct(date, format = "%Y-%m-%d %H:%M:%S"), na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+print(cluster_summary)
+```
+
+```{r cluster-platform, fig.width=10, fig.height=5}
+# Platform breakdown per cluster
+platform_tbl <- data2 %>%
+  filter(cluster > 0) %>%
+  count(cluster, platform) %>%
+  group_by(cluster) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+print(platform_tbl)
+
+ggplot(platform_tbl, aes(as.factor(cluster), pct, fill = platform)) +
+  geom_col(position = "dodge") +
+  labs(title = "Platform Distribution by Cluster",
+       x = "Cluster", y = "% of Cluster", fill = "Platform") +
+  theme_minimal()
+```
+
+```{r cluster-theme}
+# Theme label distribution per cluster
+if ("theme_label" %in% colnames(data2)) {
+  theme_tbl <- data2 %>%
+    filter(cluster > 0, !is.na(theme_label)) %>%
+    count(cluster, theme_label) %>%
+    group_by(cluster) %>%
+    mutate(pct = round(n / sum(n) * 100, 1)) %>%
+    arrange(cluster, desc(pct))
+
+  # Top 5 themes per cluster
+  theme_tbl %>%
+    slice_max(pct, n = 5) %>%
+    print(n = 50)
+}
+```
+
+```{r cluster-temporal, fig.width=12, fig.height=5}
+# Volume over time by cluster
+data2 %>%
+  filter(cluster > 0) %>%
+  mutate(datetime = as.POSIXct(date, format = "%Y-%m-%d %H:%M:%S"),
+         ym = floor_date(datetime, "quarter")) %>%
+  count(ym, cluster) %>%
+  ggplot(aes(ym, n, fill = as.factor(cluster))) +
+  geom_col(position = "stack") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Cluster Volume Over Time",
+       x = "Quarter", y = "Tweets", fill = "Cluster") +
+  theme_minimal()
+```
+
+```{r cluster-engagement-box, fig.width=10, fig.height=5}
+# Engagement boxplots (log scale for readability)
+data2 %>%
+  filter(cluster > 0, favorite_count > 0) %>%
+  ggplot(aes(as.factor(cluster), favorite_count)) +
+  geom_boxplot(outlier.alpha = 0.1) +
+  scale_y_log10(labels = scales::comma) +
+  labs(title = "Likes Distribution by Cluster (log scale)",
+       x = "Cluster", y = "Likes") +
+  theme_minimal()
+
+data2 %>%
+  filter(cluster > 0, repost_count > 0) %>%
+  ggplot(aes(as.factor(cluster), repost_count)) +
+  geom_boxplot(outlier.alpha = 0.1) +
+  scale_y_log10(labels = scales::comma) +
+  labs(title = "Retweets Distribution by Cluster (log scale)",
+       x = "Cluster", y = "Retweets") +
+  theme_minimal()
+```
+
+```{r cluster-samples}
+# Sample tweets from each cluster
+for (cl in sort(unique(data2$cluster[data2$cluster > 0]))) {
+  cat("\n========== CLUSTER", cl, "==========\n")
+  samp <- data2 %>% filter(cluster == cl) %>% sample_n(min(10, n()))
+  for (i in seq_len(nrow(samp))) {
+    cat(sprintf("  [%s | Likes: %d | RTs: %d]\n  %s\n\n",
+                samp$date[i],
+                samp$favorite_count[i],
+                samp$repost_count[i],
+                substr(samp$text[i], 1, 200)))
+  }
+}
+```
+
+## Export for Report
+
+```{r export-outputs}
+# ── Shared color palette (Set2, 4 clusters) ──────────────────────────────────
+cluster_colors <- setNames(
+  RColorBrewer::brewer.pal(4, "Set2"),
+  as.character(1:4)
+)
+
+# ── 1. Cluster summary table (first 10 cols) → CSV ───────────────────────────
+cluster_summary_export <- cluster_summary[, 1:10]
+
+# Kable preview
+knitr::kable(cluster_summary_export,
+             caption = "Cluster Summary Statistics",
+             format = "markdown",
+             digits = 3)
+```
+
+```{r export-plot-time, fig.width=12, fig.height=5}
+# ── 2. Cluster volume over time ───────────────────────────────────────────────
+plot_time <- data2 %>%
+  filter(cluster > 0) %>%
+  mutate(datetime = as.POSIXct(date, format = "%Y-%m-%d %H:%M:%S"),
+         ym = floor_date(datetime, "quarter")) %>%
+  count(ym, cluster) %>%
+  ggplot(aes(ym, n, fill = as.factor(cluster))) +
+  geom_col(position = "stack") +
+  scale_fill_manual(values = cluster_colors, name = "Cluster") +
+  labs(title = "Cluster Volume Over Time",
+       x = "Quarter", y = "Tweets") +
+  theme_minimal()
+
+plot_time
+```
+
+```{r export-plot-likes, fig.width=10, fig.height=5}
+# ── 3. Log likes boxplot — clusters colored to match time plot ────────────────
+plot_likes <- data2 %>%
+  filter(cluster > 0, favorite_count > 0) %>%
+  ggplot(aes(as.factor(cluster), favorite_count, fill = as.factor(cluster))) +
+  geom_boxplot(outlier.alpha = 0.15, outlier.size = 0.6) +
+  scale_y_log10(labels = comma) +
+  scale_fill_manual(values = cluster_colors, name = "Cluster") +
+  labs(title = "Likes Distribution by Cluster (log scale)",
+       x = "Cluster", y = "Likes") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+plot_likes
+```
+
+```{r export-plot-pies, fig.width=12, fig.height=10}
+# ── 4. Topic pie charts — one per cluster ────────────────────────────────────
+theme_tbl <- data2 %>%
+  filter(cluster > 0, !is.na(theme_label), theme_label != "") %>%
+  count(cluster, theme_label) %>%
+  group_by(cluster) %>%
+  mutate(pct = n / sum(n)) %>%
+  # Keep top 6 themes, bundle the rest as "Other"
+  arrange(cluster, desc(pct)) %>%
+  mutate(theme_display = ifelse(row_number() <= 6, theme_label, "Other")) %>%
+  group_by(cluster, theme_display) %>%
+  summarise(pct = sum(pct), .groups = "drop")
+
+plot_pies <- ggplot(theme_tbl, aes(x = "", y = pct, fill = theme_display)) +
+  geom_col(width = 1, color = "black", linewidth = 0.3) +
+  coord_polar(theta = "y") +
+  facet_wrap(~ paste("Cluster", cluster), nrow = 2) +
+  scale_fill_brewer(palette = "Paired", name = "Theme") +
+  labs(title = "Topic Distribution by Cluster") +
+  theme_void() +
+  theme(legend.position = "right",
+        strip.text = element_text(size = 11, face = "bold",
+                                  color = "black"),
+        strip.background = element_rect(
+          fill = cluster_colors[as.character(
+            as.integer(gsub("Cluster ", "", unique(
+              paste("Cluster", theme_tbl$cluster)))))],
+          color = "black"))
+
+plot_pies
+
+```
+
